@@ -14,7 +14,6 @@ from sklearn.preprocessing import LabelEncoder
 import nltk
 
 st.set_page_config(page_title="iPhone Review Analysis", layout="wide")
-st.title("📱 iPhone Review Analysis System")
 
 NLTK_DATA_DIR = "/tmp/nltk_data"
 os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -73,7 +72,7 @@ def register_user(username, email, password):
     finally:
         conn.close()
 
-def login_user(username, password):
+def authenticate_user(username, password):
     conn = get_user_db()
     cur = conn.cursor()
     cur.execute(
@@ -89,13 +88,19 @@ init_user_db()
 def preprocess_data(df):
     lemmatizer = WordNetLemmatizer()
     stop_words = set(stopwords.words("english"))
+
     def clean_text(text):
         text = str(text).lower()
         tokens = word_tokenize(text)
-        tokens = [lemmatizer.lemmatize(t) for t in tokens if t.isalnum() and t not in stop_words]
+        tokens = [
+            lemmatizer.lemmatize(t)
+            for t in tokens if t.isalnum() and t not in stop_words
+        ]
         return " ".join(tokens)
+
     for col in df.columns:
         df[col] = df[col].apply(clean_text)
+
     return df.astype(str).agg(" ".join, axis=1).tolist()
 
 @st.cache_resource
@@ -108,17 +113,22 @@ def load_electra():
 def electra_feature_extraction(texts, batch_size=16):
     tokenizer, model = load_electra()
     all_embeddings = []
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         encoded = tokenizer(batch, padding=True, truncation=True, return_tensors="pt")
+
         with torch.no_grad():
             output = model(**encoded)
+
         token_embeddings = output.last_hidden_state
         mask = encoded["attention_mask"].unsqueeze(-1).expand(token_embeddings.size()).float()
         summed = torch.sum(token_embeddings * mask, dim=1)
         counts = mask.sum(dim=1)
         mean_pooled = summed / counts
+
         all_embeddings.append(mean_pooled.cpu().numpy())
+
     return np.vstack(all_embeddings)
 
 title_model = joblib.load(os.path.join(MODEL_DIR, "ELECTRA_word_embeddings_title_ETC_model.pkl"))
@@ -143,62 +153,76 @@ le_rating = LabelEncoder().fit([str(x) for x in labels2])
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-    st.session_state.user = None
+    st.session_state.username = None
 
-menu = st.sidebar.selectbox("Menu", ["Login", "Signup", "Predict", "Logout"])
+st.title("📱 iPhone Review Analysis System")
 
-if menu == "Signup":
-    st.subheader("Create Account")
-    u = st.text_input("Username")
-    e = st.text_input("Email")
-    p = st.text_input("Password", type="password")
-    if st.button("Signup"):
-        if u and e and p:
-            if register_user(u, e, p):
-                st.success("User registered successfully")
+if not st.session_state.logged_in:
+    tab1, tab2 = st.tabs(["Login", "Signup"])
+
+    with tab1:
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if authenticate_user(u, p):
+                st.session_state.logged_in = True
+                st.session_state.username = u
+                st.success("Login successful")
+                st.rerun()
             else:
-                st.error("Username or email already exists")
-        else:
-            st.warning("Fill all fields")
+                st.error("Invalid username or password")
 
-elif menu == "Login":
-    st.subheader("Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if login_user(u, p):
-            st.session_state.logged_in = True
-            st.session_state.user = u
-            st.success("Login successful")
-        else:
-            st.error("Invalid credentials")
+    with tab2:
+        u = st.text_input("New Username")
+        e = st.text_input("Email")
+        p = st.text_input("New Password", type="password")
+        if st.button("Signup"):
+            if u and e and p:
+                if register_user(u, e, p):
+                    st.success("Signup successful. Please login.")
+                else:
+                    st.error("Username or email already exists")
+            else:
+                st.warning("All fields are required")
 
-elif menu == "Predict":
-    if not st.session_state.logged_in:
-        st.warning("Please login first")
-    else:
-        st.subheader(f"Welcome, {st.session_state.user}")
-        file = st.file_uploader("Upload CSV", type=["csv"])
-        if file:
-            df = pd.read_csv(file)
-            st.dataframe(df.head())
-            text_col = st.selectbox("Select text column", df.select_dtypes(include="object").columns)
-            if st.button("Run Prediction"):
-                with st.spinner("Running prediction..."):
-                    X_text = preprocess_data(df[[text_col]])
-                    features = electra_feature_extraction(X_text)
-                    df_out = df.copy()
-                    df_out["Predicted_title"] = le_title.inverse_transform(title_model.predict(features))
-                    df_out["Predicted_rating"] = le_rating.inverse_transform(rating_model.predict(features))
-                st.dataframe(df_out)
-                st.download_button(
-                    "Download Results",
-                    df_out.to_csv(index=False).encode("utf-8"),
-                    "predicted_output.csv",
-                    "text/csv"
+else:
+    st.success(f"Logged in as {st.session_state.username}")
+    if st.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = None
+        st.rerun()
+
+    st.subheader("Upload Test CSV and Run Prediction")
+
+    file = st.file_uploader("Upload CSV file", type=["csv"])
+    if file:
+        df = pd.read_csv(file)
+        st.dataframe(df.head())
+
+        text_col = st.selectbox(
+            "Select review column",
+            df.select_dtypes(include="object").columns
+        )
+
+        if st.button("Run Prediction"):
+            with st.spinner("Running prediction..."):
+                X_text = preprocess_data(df[[text_col]])
+                features = electra_feature_extraction(X_text)
+
+                df_out = df.copy()
+                df_out["Predicted_title"] = le_title.inverse_transform(
+                    title_model.predict(features)
+                )
+                df_out["Predicted_rating"] = le_rating.inverse_transform(
+                    rating_model.predict(features)
                 )
 
-elif menu == "Logout":
-    st.session_state.logged_in = False
-    st.session_state.user = None
-    st.success("Logged out successfully")
+            st.subheader("Prediction Results")
+            st.dataframe(df_out)
+
+            st.download_button(
+                "Download Results",
+                df_out.to_csv(index=False).encode("utf-8"),
+                "predicted_output.csv",
+                "text/csv"
+            )
