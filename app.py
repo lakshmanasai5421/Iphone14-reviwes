@@ -1,10 +1,10 @@
 import os
-import sqlite3
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import streamlit as st
+import sqlite3
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
 from nltk.tokenize import word_tokenize
@@ -14,6 +14,7 @@ from sklearn.preprocessing import LabelEncoder
 import nltk
 
 st.set_page_config(page_title="iPhone Review Analysis", layout="wide")
+st.title("📱 iPhone Review Analysis using ELECTRA + ETC")
 
 NLTK_DATA_DIR = "/tmp/nltk_data"
 os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -35,72 +36,64 @@ def download_nltk_resources():
 download_nltk_resources()
 
 MODEL_DIR = "model"
+DB_PATH = "predictions.db"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-USER_DB = "users.db"
+def get_db_connection():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def get_user_db():
-    return sqlite3.connect(USER_DB, check_same_thread=False)
-
-def init_user_db():
-    conn = get_user_db()
+def init_db():
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            email TEXT UNIQUE,
-            password TEXT,
-            created_at TEXT
+            timestamp TEXT,
+            raw_text TEXT,
+            predicted_title TEXT,
+            predicted_rating TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-def register_user(username, email, password):
-    conn = get_user_db()
+def save_predictions(df, text_col):
+    conn = get_db_connection()
     cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users (username, email, password, created_at) VALUES (?, ?, ?, ?)",
-            (username, email, password, datetime.now().isoformat())
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-def authenticate_user(username, password):
-    conn = get_user_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM users WHERE username=? AND password=?",
-        (username, password)
-    )
-    user = cur.fetchone()
+    for _, row in df.iterrows():
+        cur.execute("""
+            INSERT INTO predictions (timestamp, raw_text, predicted_title, predicted_rating)
+            VALUES (?, ?, ?, ?)
+        """, (
+            datetime.now().isoformat(),
+            str(row[text_col]),
+            str(row["Predicted_title"]),
+            str(row["Predicted_rating"])
+        ))
+    conn.commit()
     conn.close()
-    return user is not None
 
-init_user_db()
+def load_predictions(limit=100):
+    conn = get_db_connection()
+    df = pd.read_sql(
+        f"SELECT * FROM predictions ORDER BY id DESC LIMIT {limit}",
+        conn
+    )
+    conn.close()
+    return df
+
+init_db()
 
 def preprocess_data(df):
     lemmatizer = WordNetLemmatizer()
     stop_words = set(stopwords.words("english"))
-
     def clean_text(text):
         text = str(text).lower()
         tokens = word_tokenize(text)
-        tokens = [
-            lemmatizer.lemmatize(t)
-            for t in tokens if t.isalnum() and t not in stop_words
-        ]
+        tokens = [lemmatizer.lemmatize(t) for t in tokens if t.isalnum() and t not in stop_words]
         return " ".join(tokens)
-
     for col in df.columns:
         df[col] = df[col].apply(clean_text)
-
     return df.astype(str).agg(" ".join, axis=1).tolist()
 
 @st.cache_resource
@@ -113,22 +106,17 @@ def load_electra():
 def electra_feature_extraction(texts, batch_size=16):
     tokenizer, model = load_electra()
     all_embeddings = []
-
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         encoded = tokenizer(batch, padding=True, truncation=True, return_tensors="pt")
-
         with torch.no_grad():
             output = model(**encoded)
-
         token_embeddings = output.last_hidden_state
         mask = encoded["attention_mask"].unsqueeze(-1).expand(token_embeddings.size()).float()
         summed = torch.sum(token_embeddings * mask, dim=1)
         counts = mask.sum(dim=1)
         mean_pooled = summed / counts
-
         all_embeddings.append(mean_pooled.cpu().numpy())
-
     return np.vstack(all_embeddings)
 
 title_model = joblib.load(os.path.join(MODEL_DIR, "ELECTRA_word_embeddings_title_ETC_model.pkl"))
@@ -151,78 +139,27 @@ labels2 = [3.0, 4.0, 5.0]
 le_title = LabelEncoder().fit(labels1)
 le_rating = LabelEncoder().fit([str(x) for x in labels2])
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = None
+uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
-st.title("📱 iPhone Review Analysis System")
-
-if not st.session_state.logged_in:
-    tab1, tab2 = st.tabs(["Login", "Signup"])
-
-    with tab1:
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        if st.button("Login"):
-            if authenticate_user(u, p):
-                st.session_state.logged_in = True
-                st.session_state.username = u
-                st.success("Login successful")
-                st.rerun()
-            else:
-                st.error("Invalid username or password")
-
-    with tab2:
-        u = st.text_input("New Username")
-        e = st.text_input("Email")
-        p = st.text_input("New Password", type="password")
-        if st.button("Signup"):
-            if u and e and p:
-                if register_user(u, e, p):
-                    st.success("Signup successful. Please login.")
-                else:
-                    st.error("Username or email already exists")
-            else:
-                st.warning("All fields are required")
-
-else:
-    st.success(f"Logged in as {st.session_state.username}")
-    if st.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.username = None
-        st.rerun()
-
-    st.subheader("Upload Test CSV and Run Prediction")
-
-    file = st.file_uploader("Upload CSV file", type=["csv"])
-    if file:
-        df = pd.read_csv(file)
-        st.dataframe(df.head())
-
-        text_col = st.selectbox(
-            "Select review column",
-            df.select_dtypes(include="object").columns
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    st.dataframe(df.head())
+    text_column = st.selectbox("Select text column", df.select_dtypes(include="object").columns)
+    if st.button("Run Prediction"):
+        with st.spinner("Running prediction..."):
+            X_text = preprocess_data(df[[text_column]])
+            features = electra_feature_extraction(X_text)
+            df_out = df.copy()
+            df_out["Predicted_title"] = le_title.inverse_transform(title_model.predict(features))
+            df_out["Predicted_rating"] = le_rating.inverse_transform(rating_model.predict(features))
+            save_predictions(df_out, text_column)
+        st.dataframe(df_out)
+        st.download_button(
+            "Download Results",
+            df_out.to_csv(index=False).encode("utf-8"),
+            "predicted_output.csv",
+            "text/csv"
         )
 
-        if st.button("Run Prediction"):
-            with st.spinner("Running prediction..."):
-                X_text = preprocess_data(df[[text_col]])
-                features = electra_feature_extraction(X_text)
-
-                df_out = df.copy()
-                df_out["Predicted_title"] = le_title.inverse_transform(
-                    title_model.predict(features)
-                )
-                df_out["Predicted_rating"] = le_rating.inverse_transform(
-                    rating_model.predict(features)
-                )
-
-            st.subheader("Prediction Results")
-            st.dataframe(df_out)
-
-            st.download_button(
-                "Download Results",
-                df_out.to_csv(index=False).encode("utf-8"),
-                "predicted_output.csv",
-                "text/csv"
-            )
+if st.button("View Stored Predictions"):
+    st.dataframe(load_predictions())
